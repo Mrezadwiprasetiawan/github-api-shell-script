@@ -1,0 +1,52 @@
+#!/bin/bash
+
+if [[ $1 == "-h" || $1 == "-help" ]]; then
+  echo $(basename $0)" TOKEN USERNAME"
+  exit
+fi
+if (( $# < 2 )); then
+  echo $(basename $0)" TOKEN USERNAME"
+  exit
+fi
+# Token GitHub dan username
+TOKEN=$1
+USERNAME=$2
+
+# Fungsi untuk mengambil semua halaman dari API GitHub
+fetch_all_pages() {
+    local url=$1
+    local results=()
+    local page=1
+
+    while :; do
+        # Ambil data dari halaman tertentu
+        response=$(curl -s -H "Authorization: token $TOKEN" \
+                          -H "User-Agent: UnfollowScript" \
+                          "$url?page=$page&per_page=100")
+
+        # Jika respons kosong, hentikan loop
+        if [ "$(echo "$response" | jq '. | length')" -eq 0 ]; then
+            break
+        fi
+
+        # Tambahkan hasil ke array
+        results+=($(echo "$response" | jq -r '.[].login'))
+        page=$((page + 1))
+    done
+
+    echo "${results[@]}"
+}
+
+# Ambil semua daftar following dan followers
+FOLLOWING=$(fetch_all_pages "https://api.github.com/users/$USERNAME/following")
+FOLLOWERS=$(fetch_all_pages "https://api.github.com/users/$USERNAME/followers")
+
+# Unfollow pengguna yang tidak mengikuti kembali
+for USER in $FOLLOWING; do
+    if ! echo "$FOLLOWERS" | grep -qw "$USER"; then
+        echo "Unfollowing: $USER"
+        curl -X DELETE -H "Authorization: token $TOKEN" \
+                        -H "User-Agent: UnfollowScript" \
+                        "https://api.github.com/user/following/$USER"
+    fi
+done

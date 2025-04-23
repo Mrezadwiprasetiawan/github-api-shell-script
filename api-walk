@@ -1,0 +1,66 @@
+#!/bin/bash
+
+API_ROOT="https://api.github.com"
+AUTH_HEADER=""
+TOKEN=""
+
+# Fungsi untuk menampilkan pilihan dari key JSON yang merupakan URL
+show_menu() {
+  local url=$1
+  local response
+  if [ -n "$AUTH_HEADER" ]; then
+    response=$(curl -s -H "$AUTH_HEADER" "$url")
+  else
+    response=$(curl -s "$url")
+  fi
+
+  if [[ $(echo "$response" | jq  -r '.message') != "null" ]]; then
+    echo "===> Authentication required."
+    read -p "Enter your GitHub token: " TOKEN
+    AUTH_HEADER="Authorization: token $TOKEN"
+    show_menu "$url"
+    return
+  fi
+  echo "$response" | jq -r 'with_entries(select(.value | (type != "string" or (test("^https://") | not))) )'
+  echo ""
+  echo "===> Listing available API endpoints from: $url"
+  echo ""
+
+  # Ambil semua entri JSON yang merupakan string diawali https
+  mapfile -t keys < <(echo "$response" | jq -r 'to_entries[] | select(.value | type == "string" and test("^https://")) | .key')
+
+  if [ ${#keys[@]} -eq 0 ]; then
+    echo "No further navigable URLs found."
+    echo "$response" | jq .
+    return
+  fi
+
+  for i in "${!keys[@]}"; do
+    name=$(echo "${keys[$i]}" | cut -d':' -f1)
+    echo "$((i+1)). $name"
+  done
+
+  echo "0. Exit"
+  read -p "Choose an endpoint to walk: " choice
+
+  if [[ "$choice" == "0" ]]; then
+    exit 0
+  fi
+
+  index=$((choice-1))
+  selected_url=$(echo "${keys[$index]}" | cut -d':' -f2- | sed 's/^ *//')
+
+  # Deteksi placeholder seperti {user}
+  if [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; then
+    while [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; do
+      var="${BASH_REMATCH[1]}"
+      read -p "Enter value for '$var': " value
+      selected_url="${selected_url//\{$var\}/$value}"
+    done
+  fi
+
+  show_menu "$selected_url"
+}
+
+# Mulai dari root
+show_menu "$API_ROOT"
