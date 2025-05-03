@@ -15,7 +15,7 @@ PER_PAGE=100
 wait_for_rate_limit_reset() {
   echo "Mencapai batas API, menunggu hingga rate limit direset..."
   while :; do
-    rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+    rate_limit=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/rate_limit)
     remaining=$(echo "$rate_limit" | jq .rate.remaining)
     reset_time=$(echo "$rate_limit" | jq .rate.reset)
     if [[ $remaining -gt 0 ]]; then
@@ -35,7 +35,7 @@ while true; do
   # Mendapatkan daftar pengikut (100 per halaman)
   response=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/users/$USERNAME/followers?per_page=$PER_PAGE&page=$PAGE")
   # Cek rate limit
-  rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+  rate_limit=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/rate_limit)
   remaining=$(echo "$rate_limit" | jq .rate.remaining)
   if [[ $remaining -le 0 ]]; then
     wait_for_rate_limit_reset

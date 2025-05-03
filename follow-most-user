@@ -46,13 +46,21 @@ get_users() {
   # Tampilkan respons JSON untuk memastikan data yang diterima
   echo "Respons JSON dari API:"
   echo "$body" | jq .
-  echo "$body"
 }
 
 # Loop untuk semua halaman
 page=1
 while :; do
+  # Cek rate limit
+  rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+  remaining=$(echo "$rate_limit" | jq .rate.remaining)
+  if [[ $remaining -le 0 ]]; then
+    wait_for_rate_limit_reset
+  else
+    echo "Masih ada $remaining permintaan tersisa. Melanjutkan..."
+  fi
   get_users $page
+
   # Validasi apakah respons adalah JSON valid
   if ! echo "$response" | jq . > /dev/null 2>&1; then
     echo "Kesalahan: Respons dari API bukan JSON yang valid."
@@ -88,14 +96,6 @@ while :; do
       echo "Gagal mengikuti: $username (Status: $follow_response)"
     fi
   done
-  # Cek rate limit
-  rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-  remaining=$(echo "$rate_limit" | jq .rate.remaining)
-  if [[ $remaining -le 0 ]]; then
-    wait_for_rate_limit_reset
-  else
-    echo "Masih ada $remaining permintaan tersisa. Melanjutkan..."
-  fi
   # Lanjutkan ke halaman berikutnya
   page=$((page + 1))
 done
