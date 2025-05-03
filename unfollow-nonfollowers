@@ -8,45 +8,47 @@ if (( $# < 2 )); then
   echo $(basename $0)" TOKEN USERNAME"
   exit
 fi
-# Token GitHub dan username
+
 TOKEN=$1
 USERNAME=$2
 
-# Fungsi untuk mengambil semua halaman dari API GitHub
 fetch_all_pages() {
-    local url=$1
-    local results=()
-    local page=1
+  local url=$1
+  local results=()
+  local page=1
 
-    while :; do
-        # Ambil data dari halaman tertentu
-        response=$(curl -s -H "Authorization: token $TOKEN" \
-                          -H "User-Agent: UnfollowScript" \
-                          "$url?page=$page&per_page=100")
+  while :; do
+    response=$(curl -s -H "Authorization: token $TOKEN" \
+                      -H "User-Agent: UnfollowScript" \
+                      "$url?page=$page&per_page=100")
+    if [ "$(echo "$response" | jq '. | length')" -eq 0 ]; then
+      break
+    fi
+    results+=($(echo "$response" | jq -r '.[].login'))
+    page=$((page + 1))
+  done
 
-        # Jika respons kosong, hentikan loop
-        if [ "$(echo "$response" | jq '. | length')" -eq 0 ]; then
-            break
-        fi
-
-        # Tambahkan hasil ke array
-        results+=($(echo "$response" | jq -r '.[].login'))
-        page=$((page + 1))
-    done
-
-    echo "${results[@]}"
+  echo "${results[@]}"
 }
 
-# Ambil semua daftar following dan followers
-FOLLOWING=$(fetch_all_pages "https://api.github.com/users/$USERNAME/following")
-FOLLOWERS=$(fetch_all_pages "https://api.github.com/users/$USERNAME/followers")
+# Ambil semua daftar
+FOLLOWING=($(fetch_all_pages "https://api.github.com/users/$USERNAME/following"))
+FOLLOWERS=($(fetch_all_pages "https://api.github.com/users/$USERNAME/followers"))
 
-# Unfollow pengguna yang tidak mengikuti kembali
-for USER in $FOLLOWING; do
-    if ! echo "$FOLLOWERS" | grep -qw "$USER"; then
-        echo "Unfollowing: $USER"
-        curl -X DELETE -H "Authorization: token $TOKEN" \
-                        -H "User-Agent: UnfollowScript" \
-                        "https://api.github.com/user/following/$USER"
+# Kurangi FOLLOWING dengan FOLLOWERS
+for f in "${FOLLOWERS[@]}"; do
+  for i in "${!FOLLOWING[@]}"; do
+    if [[ "${FOLLOWING[i]}" == "$f" ]]; then
+      unset 'FOLLOWING[i]'
+      break
     fi
+  done
+done
+
+# Unfollow sisanya
+for USER in "${FOLLOWING[@]}"; do
+  echo "Unfollowing: $USER"
+  curl -X DELETE -H "Authorization: token $TOKEN" \
+                  -H "User-Agent: UnfollowScript" \
+                  "https://api.github.com/user/following/$USER"
 done
