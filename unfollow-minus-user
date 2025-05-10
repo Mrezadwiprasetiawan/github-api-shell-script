@@ -71,13 +71,14 @@ while read -r u; do
       -H "Authorization: token $GITHUB_TOKEN" \
       https://api.github.com/user/following/"$u")
     if (( code == 204 )); then
-      printf "\r%-60s\n" "$u: unfollowed ($followers followers)"
+      printf "\r%-60s\n" "$u: unfollowed (followers: $followers)"
       (( removed++ ))
     else
       echo "$u: failed to unfollow (HTTP $code)"
       echo "$u" >> "$TMP_FILE"
     fi
   else
+    printf "\r%-60s\n" "$u: kept (followers: $followers)"
     echo "$u" >> "$TMP_FILE"
   fi
   (( count++ ))
