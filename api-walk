@@ -4,8 +4,8 @@ API_ROOT="https://api.github.com"
 AUTH_HEADER=""
 TOKEN=""
 
-# Fungsi untuk menampilkan pilihan dari key JSON yang merupakan URL
-show_menu() {
+# Function to fetch API and handle authentication prompt if needed
+fetch_api() {
   local url=$1
   local response
   if [ -n "$AUTH_HEADER" ]; then
@@ -14,20 +14,40 @@ show_menu() {
     response=$(curl -s "$url")
   fi
 
-  if [[ $(echo "$response" | jq  -r '.message') != "null" ]]; then
-    echo "===> Authentication required."
-    read -p "Enter your GitHub token: " TOKEN
-    AUTH_HEADER="Authorization: token $TOKEN"
-    show_menu "$url"
-    return
+  # Detect if authentication is required or forbidden
+  local msg=$(echo "$response" | jq -r '.message // empty')
+  if [[ "$msg" =~ "Requires authentication" || "$msg" =~ "Bad credentials" || "$msg" =~ "Not Found" || "$msg" =~ "API rate limit exceeded" ]]; then
+    echo "===> Authentication required or invalid token."
+    while true; do
+      read -s -p "Enter your GitHub Personal Access Token: " TOKEN
+      echo
+      AUTH_HEADER="Authorization: token $TOKEN"
+      # Try again with new token
+      response=$(curl -s -H "$AUTH_HEADER" "$url")
+      msg=$(echo "$response" | jq -r '.message // empty')
+      if [[ ! "$msg" =~ "Requires authentication" && ! "$msg" =~ "Bad credentials" && ! "$msg" =~ "API rate limit exceeded" ]]; then
+        break
+      fi
+      echo "Invalid or insufficient token. Please try again."
+    done
   fi
-  echo "$response" | jq -r 'with_entries(select(.value | (type != "string" or (test("^https://") | not))) )'
-  echo ""
-  echo "===> Listing available API endpoints from: $url"
-  echo ""
+  echo "$response"
+}
 
-  # Ambil semua entri JSON yang merupakan string diawali https
-  mapfile -t keys < <(echo "$response" | jq -r 'to_entries[] | select(.value | type == "string" and test("^https://")) | .key')
+# Show and walk API menu
+show_menu() {
+  local url=$1
+  local response
+  response=$(fetch_api "$url")
+
+  # Show all non-URL keys for context
+  echo "$response" | jq -r 'with_entries(select(.value | (type != "string" or (test("^https://") | not))))'
+  echo
+  echo "===> Listing available API endpoints from: $url"
+  echo
+
+  # Find all URL-valued keys
+  mapfile -t keys < <(echo "$response" | jq -r 'to_entries[] | select(.value | type == "string" and test("^https://")) | "\(.key):\(.value)"')
 
   if [ ${#keys[@]} -eq 0 ]; then
     echo "No further navigable URLs found."
@@ -41,7 +61,14 @@ show_menu() {
   done
 
   echo "0. Exit"
-  read -p "Choose an endpoint to walk: " choice
+  while true; do
+    read -p "Choose an endpoint to walk: " choice
+    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 0 && "$choice" -le ${#keys[@]} ]]; then
+      break
+    else
+      echo "Invalid choice. Try again."
+    fi
+  done
 
   if [[ "$choice" == "0" ]]; then
     exit 0
@@ -50,17 +77,15 @@ show_menu() {
   index=$((choice-1))
   selected_url=$(echo "${keys[$index]}" | cut -d':' -f2- | sed 's/^ *//')
 
-  # Deteksi placeholder seperti {user}
-  if [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; then
-    while [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; do
-      var="${BASH_REMATCH[1]}"
-      read -p "Enter value for '$var': " value
-      selected_url="${selected_url//\{$var\}/$value}"
-    done
-  fi
+  # Prompt for any placeholders like {user}
+  while [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; do
+    var="${BASH_REMATCH[1]}"
+    read -p "Enter value for '$var': " value
+    selected_url="${selected_url//\{$var\}/$value}"
+  done
 
   show_menu "$selected_url"
 }
 
-# Mulai dari root
+# Start the API walker
 show_menu "$API_ROOT"

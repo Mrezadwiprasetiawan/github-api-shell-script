@@ -1,101 +1,140 @@
 #!/bin/bash
 
-if (( $# < 2)); then
-  echo $(basename $0)" GITHUB_TOKEN COUNTRY"
-  exit
+if (( $# < 1 )); then
+  echo "Usage: $(basename "$0") GITHUB_TOKEN [--reset] [--file FILE_NAME] [--min-followers N] [--max-followers N]"
+  exit 1
 fi
-# Token GitHub dan negara
+
 GITHUB_TOKEN=$1
-COUNTRY=$2
-PER_PAGE=100  # Jumlah hasil per halaman
+shift
 
-echo "Mencari pengguna paling aktif di GitHub berdasarkan negara: $COUNTRY"
+RESET=0
+FOLLOWED_FILE="followed_users.txt"
+MIN_FOLLOWERS=1000
+MAX_FOLLOWERS=
+PER_PAGE=100
 
-# Fungsi untuk menunggu hingga rate limit direset
+# Parse options
+while (( $# )); do
+  case "$1" in
+    --reset)
+      RESET=1
+      shift
+      ;;
+    --file)
+      shift
+      FOLLOWED_FILE="$1"
+      shift
+      ;;
+    --min-followers)
+      shift
+      MIN_FOLLOWERS="$1"
+      shift
+      ;;
+    --max-followers)
+      shift
+      MAX_FOLLOWERS="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+if (( RESET )); then
+  rm -f "$FOLLOWED_FILE"
+fi
+touch "$FOLLOWED_FILE"
+
+# Load followed users into an associative array for fast lookup
+declare -A followed
+while read -r user; do
+  [[ -n "$user" ]] && followed["$user"]=1
+done < "$FOLLOWED_FILE"
+
+tput civis
+trap 'tput cnorm; exit' INT TERM EXIT
+
 wait_for_rate_limit_reset() {
-  echo "Mencapai batas API, menunggu hingga rate limit direset..."
+  echo -e "\nRate limit exceeded; waiting for reset…"
   while :; do
-    rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-    remaining=$(echo "$rate_limit" | jq .rate.remaining)
-    reset_time=$(echo "$rate_limit" | jq .rate.reset)
-    if [[ $remaining -gt 0 ]]; then
-      echo "Rate limit tersedia kembali: $remaining permintaan tersisa."
-      break
-    fi
-    current_time=$(date +%s)
-    wait_time=$((reset_time - current_time))
-    echo "Menunggu $wait_time detik hingga rate limit direset..."
-    sleep $wait_time
+    rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+    rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+    rst=$(echo "$rl" | jq -r '.resources.core.reset // 0')
+    (( rem > 0 )) && break
+    now=$(date +%s)
+    sleep $(( rst > now ? rst - now : 1 ))
   done
 }
 
-# Fungsi untuk mengambil data pengguna
-get_users() {
+get_top_users() {
   local page=$1
-  echo "Mengambil halaman $page..."
-  response=$(curl -s -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" \
-    "https://api.github.com/search/users?q=location:$COUNTRY&per_page=$PER_PAGE&page=$page")
-  http_code=$(echo "$response" | tail -n1)  # Ambil kode status HTTP
-  body=$(echo "$response" | sed '$d')  # Ambil JSON body (tanpa kode status HTTP)
-  # Cek kode status HTTP
-  if [[ "$http_code" -ne 200 ]]; then
-    echo "Kesalahan: API mengembalikan status $http_code"
-    echo "$body"  # Cetak body untuk informasi lebih lanjut
-    exit 1
+  local q="followers:>=$MIN_FOLLOWERS"
+  if [[ -n "$MAX_FOLLOWERS" ]]; then
+    q="followers:$MIN_FOLLOWERS..$MAX_FOLLOWERS"
   fi
-  # Tampilkan respons JSON untuk memastikan data yang diterima
-  echo "Respons JSON dari API:"
-  echo "$body" | jq .
+  curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/search/users?q=$q&sort=followers&order=desc&per_page=$PER_PAGE&page=$page"
 }
 
-# Loop untuk semua halaman
+count=0
 page=1
-while :; do
-  # Cek rate limit
-  rate_limit=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-  remaining=$(echo "$rate_limit" | jq .rate.remaining)
-  if [[ $remaining -le 0 ]]; then
-    wait_for_rate_limit_reset
-  else
-    echo "Masih ada $remaining permintaan tersisa. Melanjutkan..."
-  fi
-  get_users $page
 
-  # Validasi apakah respons adalah JSON valid
-  if ! echo "$response" | jq . > /dev/null 2>&1; then
-    echo "Kesalahan: Respons dari API bukan JSON yang valid."
-    exit 1
-  fi
-  # Mengecek apakah ada hasil di halaman ini
-  users=$(echo "$response" | jq -c '.items[] | {login: .login}')
-  if [[ -z "$users" ]]; then
-    echo "Tidak ada pengguna lagi di halaman $page. Proses selesai."
-    break
-  fi
-  echo "Memproses pengguna di halaman $page:"
-  # Loop untuk setiap pengguna di halaman ini
-  echo "$users" | while read user; do
-    username=$(echo "$user" | jq -r .login)
-    echo "Memproses pengguna: $username"
-    # Cek apakah pengguna sudah diikuti
-    check_follow=$(curl -s -o /dev/null -w "%{http_code}" \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      "https://api.github.com/user/following/$username")
-    if [[ $check_follow -eq 204 ]]; then
-      echo "Anda sudah mengikuti: $username"
+while :; do
+  # Rate limit check before batch
+  rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+  rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+  (( rem <= 1 )) && wait_for_rate_limit_reset
+
+  users_json=$(get_top_users $page)
+  user_logins=$(echo "$users_json" | jq -r '.items[]?.login')
+  [[ -z "$user_logins" ]] && break
+
+  for u in $user_logins; do
+    printf "\r%-60s" "$u: checking…"
+    # Skip if already followed in our set
+    if [[ ${followed["$u"]+_} ]]; then
       continue
     fi
-    # Auto-follow pengguna yang belum diikuti
-    follow_response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+
+    # Get follower count for this user (optional: verify again)
+    followers=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+      "https://api.github.com/users/$u" | jq .followers)
+    if (( followers < MIN_FOLLOWERS )); then
+      continue
+    fi
+    if [[ -n "$MAX_FOLLOWERS" && $followers -gt $MAX_FOLLOWERS ]]; then
+      continue
+    fi
+
+    # Try to follow (idempotent)
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
       -H "Authorization: token $GITHUB_TOKEN" \
-      "https://api.github.com/user/following/$username")
-    # Cek status respons follow
-    if [[ $follow_response -eq 204 ]]; then
-      echo "Berhasil mengikuti: $username"
-    else
-      echo "Gagal mengikuti: $username (Status: $follow_response)"
+      https://api.github.com/user/following/"$u")
+
+    if (( code == 204 )); then
+      echo "$u" >> "$FOLLOWED_FILE"
+      followed["$u"]=1
+      (( count++ ))
+      printf "\r%-60s\n" "$u: followed ($followers followers)"
+    elif (( code == 403 )); then
+      wait_for_rate_limit_reset
+      code2=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        https://api.github.com/user/following/"$u")
+      if (( code2 == 204 )); then
+        echo "$u" >> "$FOLLOWED_FILE"
+        followed["$u"]=1
+        (( count++ ))
+      fi
     fi
   done
-  # Lanjutkan ke halaman berikutnya
-  page=$((page + 1))
+
+  # Next page
+  ((page++))
 done
+
+tput cnorm
+echo -e "\nDone. Total followed: $count"

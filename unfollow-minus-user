@@ -1,0 +1,89 @@
+#!/bin/bash
+
+if (( $# < 2 )); then
+  echo "Usage: $(basename "$0") GITHUB_TOKEN MIN_FOLLOWERS [--file FILE_NAME]"
+  exit 1
+fi
+
+GITHUB_TOKEN=$1
+MIN_FOLLOWERS=$2
+shift 2
+
+FOLLOWED_FILE="followed_users.txt"
+
+# Optional: custom file
+while (( $# )); do
+  case "$1" in
+    --file)
+      shift
+      FOLLOWED_FILE="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -f "$FOLLOWED_FILE" ]]; then
+  echo "Followed file $FOLLOWED_FILE not found."
+  exit 1
+fi
+
+tput civis
+trap 'tput cnorm; exit' INT TERM EXIT
+
+wait_for_rate_limit_reset() {
+  echo -e "\nRate limit exceeded; waiting for reset…"
+  while :; do
+    rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+    rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+    rst=$(echo "$rl" | jq -r '.resources.core.reset // 0')
+    (( rem > 0 )) && break
+    now=$(date +%s)
+    sleep $(( rst > now ? rst - now : 1 ))
+  done
+}
+
+TMP_FILE=$(mktemp)
+count=0
+removed=0
+
+while read -r u; do
+  [[ -z "$u" ]] && continue
+  printf "\r%-60s" "$u: checking…"
+
+  rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+  rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+  (( rem <= 1 )) && wait_for_rate_limit_reset
+
+  followers=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/users/$u" | jq .followers)
+  if [[ -z "$followers" || "$followers" == "null" ]]; then
+    echo "$u: user not found or error."
+    continue
+  fi
+
+  if (( followers < MIN_FOLLOWERS )); then
+    # Unfollow
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+      -H "Authorization: token $GITHUB_TOKEN" \
+      https://api.github.com/user/following/"$u")
+    if (( code == 204 )); then
+      printf "\r%-60s\n" "$u: unfollowed ($followers followers)"
+      (( removed++ ))
+    else
+      echo "$u: failed to unfollow (HTTP $code)"
+      echo "$u" >> "$TMP_FILE"
+    fi
+  else
+    echo "$u" >> "$TMP_FILE"
+  fi
+  (( count++ ))
+done < "$FOLLOWED_FILE"
+
+mv "$TMP_FILE" "$FOLLOWED_FILE"
+
+tput cnorm
+echo -e "\nDone. Checked: $count | Unfollowed: $removed"
