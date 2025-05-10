@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# Script untuk bulk unfollow GitHub
+# Usage: bash unfollow_users.sh <github_token> [username_file]
+
+token="$1"
+file="${2:-followed_users.txt}"
+
+if [[ -z "$token" ]]; then
+  echo "Error: GitHub token harus disediakan sebagai parameter pertama."
+  echo "Usage: $0 <github_token> [username_file]"
+  exit 1
+fi
+
+if [[ ! -f "$file" ]]; then
+  echo "Error: File '$file' tidak ditemukan."
+  exit 1
+fi
+
+while IFS= read -r username; do
+  [[ -z "$username" ]] && continue
+  echo "Unfollowing $username"
+  curl -s -X DELETE \
+    -H "Authorization: token $token" \
+    https://api.github.com/user/following/$username
+done < "$file"
+
+echo "Selesai unfollow semua pengguna dari '$file'."

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $(basename "$0") GITHUB_TOKEN [--file FILE]" >&2
+  exit 1
+fi
+GITHUB_TOKEN=$1; shift
+
+OUTPUT_FILE="followed_users.txt"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --file)
+      shift
+      OUTPUT_FILE=$1
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+: >"$OUTPUT_FILE"
+PER_PAGE=100; PAGE=1
+
+while :; do
+  RESP=$(curl -s \
+    -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/user/following?per_page=$PER_PAGE&page=$PAGE")
+  USERS=$(jq -r '.[].login' <<<"$RESP")
+  [ -z "$USERS" ] && break
+
+  # 1) Simpan hanya username
+  printf "%s\n" $USERS >>"$OUTPUT_FILE"
+
+  # 2) (Opsional) Jika mau follower count, uncomment blok ini:
+  # for u in $USERS; do
+  #   cnt=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  #     "https://api.github.com/users/$u" \
+  #     | jq -r '.followers // 0')
+  #   printf "%s %s\n" "$u" "$cnt" >>"$OUTPUT_FILE"
+  # done
+
+  ((PAGE++))
+done
+
+echo "Saved $(wc -l <"$OUTPUT_FILE") entries to $OUTPUT_FILE"
