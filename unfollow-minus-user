@@ -1,7 +1,11 @@
 #!/bin/bash
+# unfollow-minus-user: Unfollow users in FOLLOWED_FILE who have fewer than MIN_FOLLOWERS followers.
+# Usage: ./unfollow-minus-user GITHUB_TOKEN MIN_FOLLOWERS [--file FILE]
+
+set -uo pipefail
 
 if (( $# < 2 )); then
-  echo "Usage: $(basename "$0") GITHUB_TOKEN MIN_FOLLOWERS [--file FILE_NAME]"
+  echo "Usage: $(basename "$0") GITHUB_TOKEN MIN_FOLLOWERS [--file FILE]"
   exit 1
 fi
 
@@ -10,39 +14,39 @@ MIN_FOLLOWERS=$2
 shift 2
 
 FOLLOWED_FILE="followed_users.txt"
-
-# Optional: custom file
 while (( $# )); do
   case "$1" in
-    --file)
-      shift
-      FOLLOWED_FILE="$1"
-      shift
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
+    --file) shift ; FOLLOWED_FILE="$1" ; shift ;;
+    *)      echo "Unknown option: $1" >&2 ; exit 1 ;;
   esac
 done
 
 if [[ ! -f "$FOLLOWED_FILE" ]]; then
-  echo "Followed file $FOLLOWED_FILE not found."
+  echo "Followed file '$FOLLOWED_FILE' not found." >&2
   exit 1
 fi
 
-tput civis
-trap 'tput cnorm; exit' INT TERM EXIT
+BASE_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+API="https://api.github.com"
 
+tput civis 2>/dev/null || true
+trap 'tput cnorm 2>/dev/null || true' INT TERM EXIT
+
+# --------------------------------------------------------------------------- #
+# wait_for_rate_limit_reset
+# --------------------------------------------------------------------------- #
 wait_for_rate_limit_reset() {
   echo -e "\nRate limit exceeded; waiting for reset…"
-  while :; do
-    rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
+  while true; do
+    local rl rem rst now wait_sec
+    rl=$(curl -sf -H "$BASE_HEADER" "$API/rate_limit" 2>/dev/null) || rl="{}"
     rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
     rst=$(echo "$rl" | jq -r '.resources.core.reset // 0')
-    (( rem > 0 )) && break
+    (( rem > 0 )) && return
     now=$(date +%s)
-    sleep $(( rst > now ? rst - now : 1 ))
+    wait_sec=$(( rst - now ))
+    (( wait_sec < 1 )) && wait_sec=5
+    sleep "$wait_sec"
   done
 }
 
@@ -50,41 +54,67 @@ TMP_FILE=$(mktemp)
 count=0
 removed=0
 
-while read -r u; do
+# Batch rate-limit check: fetch once per N users instead of every user
+RATE_CHECK_INTERVAL=20
+call_counter=0
+
+while IFS= read -r u; do
   [[ -z "$u" ]] && continue
-  printf "\r%-60s" "$u: checking…"
+  printf "\r%-70s" "$u: checking…"
 
-  rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-  rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
-  (( rem <= 1 )) && wait_for_rate_limit_reset
+  # Check rate limit every RATE_CHECK_INTERVAL calls
+  (( ++call_counter ))
+  if (( call_counter % RATE_CHECK_INTERVAL == 0 )); then
+    rl=$(curl -sf -H "$BASE_HEADER" "$API/rate_limit" 2>/dev/null) || rl="{}"
+    rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+    (( rem <= 2 )) && wait_for_rate_limit_reset
+  fi
 
-  followers=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    "https://api.github.com/users/$u" | jq .followers)
+  user_info=$(curl -sf -H "$BASE_HEADER" "$API/users/$u" 2>/dev/null) || user_info="{}"
+  followers=$(echo "$user_info" | jq -r '.followers // empty')
+
   if [[ -z "$followers" || "$followers" == "null" ]]; then
-    echo "$u: user not found or error."
+    printf "\r%-70s\n" "$u: user not found or API error – skipping"
     continue
   fi
 
   if (( followers < MIN_FOLLOWERS )); then
-    # Unfollow
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      https://api.github.com/user/following/"$u")
-    if (( code == 204 )); then
-      printf "\r%-60s\n" "$u: unfollowed (followers: $followers)"
-      (( removed++ ))
-    else
-      echo "$u: failed to unfollow (HTTP $code)"
-      echo "$u" >> "$TMP_FILE"
-    fi
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -X DELETE \
+      -H "$BASE_HEADER" \
+      "$API/user/following/$u")
+    case "$code" in
+      204)
+        printf "\r%-70s\n" "$u: unfollowed (followers: $followers)"
+        (( ++removed )) || true
+        ;;
+      403|429)
+        wait_for_rate_limit_reset
+        code2=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X DELETE -H "$BASE_HEADER" \
+          "$API/user/following/$u")
+        if [[ "$code2" == "204" ]]; then
+          printf "\r%-70s\n" "$u: unfollowed after retry"
+          (( ++removed )) || true
+        else
+          printf "\r%-70s\n" "$u: failed to unfollow (HTTP $code2) – kept"
+          echo "$u" >> "$TMP_FILE"
+        fi
+        ;;
+      *)
+        printf "\r%-70s\n" "$u: failed to unfollow (HTTP $code) – kept"
+        echo "$u" >> "$TMP_FILE"
+        ;;
+    esac
   else
-    printf "\r%-60s\n" "$u: kept (followers: $followers)"
+    printf "\r%-70s\n" "$u: kept (followers: $followers)"
     echo "$u" >> "$TMP_FILE"
   fi
-  (( count++ ))
+  (( ++count )) || true
+
 done < "$FOLLOWED_FILE"
 
 mv "$TMP_FILE" "$FOLLOWED_FILE"
 
-tput cnorm
+tput cnorm 2>/dev/null || true
 echo -e "\nDone. Checked: $count | Unfollowed: $removed"

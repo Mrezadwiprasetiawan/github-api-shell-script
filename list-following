@@ -1,49 +1,57 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# list-following: Dump the list of users the authenticated user follows to a file.
+# Usage: ./list-following GITHUB_TOKEN [--file FILE]
+
+set -uo pipefail
 
 if [ $# -lt 1 ]; then
   echo "Usage: $(basename "$0") GITHUB_TOKEN [--file FILE]" >&2
   exit 1
 fi
-GITHUB_TOKEN=$1; shift
+
+GITHUB_TOKEN=$1
+shift
 
 OUTPUT_FILE="followed_users.txt"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --file)
-      shift
-      OUTPUT_FILE=$1
-      shift
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      exit 1
-      ;;
+    --file) shift ; OUTPUT_FILE="$1" ; shift ;;
+    *)      echo "Unknown option: $1" >&2 ; exit 1 ;;
   esac
 done
 
-: >"$OUTPUT_FILE"
-PER_PAGE=100; PAGE=1
+BASE_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+API="https://api.github.com"
+PER_PAGE=100
+PAGE=1
 
-while :; do
-  RESP=$(curl -s \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    "https://api.github.com/user/following?per_page=$PER_PAGE&page=$PAGE")
-  USERS=$(jq -r '.[].login' <<<"$RESP")
-  [ -z "$USERS" ] && break
+: > "$OUTPUT_FILE"   # truncate / create
 
-  # 1) Simpan hanya username
-  printf "%s\n" $USERS >>"$OUTPUT_FILE"
+echo "Fetching list of users you follow…"
 
-  # 2) (Opsional) Jika mau follower count, uncomment blok ini:
-  # for u in $USERS; do
-  #   cnt=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-  #     "https://api.github.com/users/$u" \
-  #     | jq -r '.followers // 0')
-  #   printf "%s %s\n" "$u" "$cnt" >>"$OUTPUT_FILE"
-  # done
+while true; do
+  RESP=$(curl -sf \
+    -H "$BASE_HEADER" \
+    "$API/user/following?per_page=$PER_PAGE&page=$PAGE" 2>/dev/null) || RESP="[]"
 
-  ((PAGE++))
+  # Handle API-level errors
+  MSG=$(echo "$RESP" | jq -r '.message // empty' 2>/dev/null)
+  if [[ -n "$MSG" && "$MSG" != "null" ]]; then
+    echo "API error on page $PAGE: $MSG" >&2
+    exit 1
+  fi
+
+  # jq outputs one login per line; read into array to handle safely
+  mapfile -t USERS < <(echo "$RESP" | jq -r '.[].login' 2>/dev/null)
+
+  # Empty page means we're done
+  (( ${#USERS[@]} == 0 )) && break
+
+  # Write one username per line – quoted-safe with printf
+  printf '%s\n' "${USERS[@]}" >> "$OUTPUT_FILE"
+
+  (( PAGE++ ))
 done
 
-echo "Saved $(wc -l <"$OUTPUT_FILE") entries to $OUTPUT_FILE"
+total=$(wc -l < "$OUTPUT_FILE")
+echo "Saved $total users to '$OUTPUT_FILE'."

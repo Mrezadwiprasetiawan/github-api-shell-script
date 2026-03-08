@@ -1,54 +1,129 @@
 #!/bin/bash
+# unfollow-nonfollowers: Unfollow everyone you follow who does NOT follow you back.
+# Usage: ./unfollow-nonfollowers TOKEN USERNAME
 
-if [[ $1 == "-h" || $1 == "-help" ]]; then
-  echo $(basename $0)" TOKEN USERNAME"
-  exit
+set -uo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: $(basename "$0") TOKEN USERNAME"
+  exit 0
 fi
 if (( $# < 2 )); then
-  echo $(basename $0)" TOKEN USERNAME"
-  exit
+  echo "Usage: $(basename "$0") TOKEN USERNAME" >&2
+  exit 1
 fi
 
 TOKEN=$1
 USERNAME=$2
 
-fetch_all_pages() {
-  local url=$1
-  local results=()
-  local page=1
+BASE_HEADER="Authorization: Bearer $TOKEN"
+UA_HEADER="User-Agent: unfollow-nonfollowers-script"
+API="https://api.github.com"
 
-  while :; do
-    response=$(curl -s -H "Authorization: token $TOKEN" \
-                      -H "User-Agent: UnfollowScript" \
-                      "$url?page=$page&per_page=100")
-    if [ "$(echo "$response" | jq '. | length')" -eq 0 ]; then
-      break
-    fi
-    results+=($(echo "$response" | jq -r '.[].login'))
-    page=$((page + 1))
+# --------------------------------------------------------------------------- #
+# wait_for_rate_limit_reset
+# --------------------------------------------------------------------------- #
+wait_for_rate_limit_reset() {
+  echo "Rate limit exceeded – waiting for reset…"
+  while true; do
+    local rl rem rst now wait_sec
+    rl=$(curl -sf -H "$BASE_HEADER" "$API/rate_limit" 2>/dev/null) || rl="{}"
+    rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
+    rst=$(echo "$rl" | jq -r '.resources.core.reset // 0')
+    (( rem > 0 )) && return
+    now=$(date +%s)
+    wait_sec=$(( rst - now ))
+    (( wait_sec < 1 )) && wait_sec=5
+    echo "  sleeping ${wait_sec}s…"
+    sleep "$wait_sec"
   done
-
-  echo "${results[@]}"
 }
 
-# Ambil semua daftar
-FOLLOWING=($(fetch_all_pages "https://api.github.com/users/$USERNAME/following"))
-FOLLOWERS=($(fetch_all_pages "https://api.github.com/users/$USERNAME/followers"))
+# --------------------------------------------------------------------------- #
+# fetch_all_logins <endpoint_url>
+#   Paginates through all pages of a user-list endpoint and echoes logins.
+# --------------------------------------------------------------------------- #
+fetch_all_logins() {
+  local url=$1
+  local page=1
 
-# Kurangi FOLLOWING dengan FOLLOWERS
-for f in "${FOLLOWERS[@]}"; do
-  for i in "${!FOLLOWING[@]}"; do
-    if [[ "${FOLLOWING[i]}" == "$f" ]]; then
-      unset 'FOLLOWING[i]'
-      break
+  while true; do
+    local resp
+    resp=$(curl -sf \
+      -H "$BASE_HEADER" \
+      -H "$UA_HEADER" \
+      "${url}?page=${page}&per_page=100" 2>/dev/null) || resp="[]"
+
+    # Surface API errors
+    local msg
+    msg=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)
+    if [[ -n "$msg" && "$msg" != "null" ]]; then
+      echo "API error fetching $url (page $page): $msg" >&2
+      # Check if it is a rate limit error, wait and retry
+      if [[ "$msg" == *"rate limit"* || "$msg" == *"abuse"* ]]; then
+        wait_for_rate_limit_reset
+        continue
+      fi
+      return 1
     fi
+
+    local count
+    count=$(echo "$resp" | jq 'length' 2>/dev/null)
+    (( count == 0 )) && break
+
+    echo "$resp" | jq -r '.[].login'
+    (( page++ ))
   done
+}
+
+echo "Fetching list of users you follow…"
+# Use authenticated /user/following for the people WE follow (token = USERNAME's token)
+mapfile -t FOLLOWING < <(fetch_all_logins "$API/user/following")
+
+echo "Fetching list of your followers…"
+mapfile -t FOLLOWERS_ARR < <(fetch_all_logins "$API/users/$USERNAME/followers")
+
+# Build an associative array for O(1) lookup instead of O(n) inner loop
+declare -A is_follower
+for f in "${FOLLOWERS_ARR[@]}"; do
+  is_follower["$f"]=1
 done
 
-# Unfollow sisanya
-for USER in "${FOLLOWING[@]}"; do
-  echo "Unfollowing: $USER"
-  curl -X DELETE -H "Authorization: token $TOKEN" \
-                  -H "User-Agent: UnfollowScript" \
-                  "https://api.github.com/user/following/$USER"
+echo "Following: ${#FOLLOWING[@]} | Followers: ${#FOLLOWERS_ARR[@]}"
+echo "Unfollowing non-followers…"
+
+unfollow_count=0
+skip_count=0
+
+for user in "${FOLLOWING[@]}"; do
+  if [[ -z "${is_follower["$user"]+_}" ]]; then
+    printf "Unfollowing %-40s " "$user"
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -X DELETE \
+      -H "$BASE_HEADER" \
+      -H "$UA_HEADER" \
+      "$API/user/following/$user")
+    case "$http_code" in
+      204)
+        echo "OK"
+        (( ++unfollow_count )) || true
+        ;;
+      403|429)
+        echo "rate limited – waiting…"
+        wait_for_rate_limit_reset
+        code2=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X DELETE -H "$BASE_HEADER" -H "$UA_HEADER" \
+          "$API/user/following/$user")
+        [[ "$code2" == "204" ]] && { echo "  OK (retry)"; (( ++unfollow_count )) || true; } \
+                                 || echo "  failed (HTTP $code2)"
+        ;;
+      *)
+        echo "HTTP $http_code"
+        ;;
+    esac
+  else
+    (( ++skip_count )) || true
+  fi
 done
+
+echo "Done. Unfollowed: $unfollow_count | Mutual (kept): $skip_count"

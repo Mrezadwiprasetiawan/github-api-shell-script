@@ -1,91 +1,218 @@
 #!/bin/bash
+# api-walk: Interactive GitHub API explorer
+# Usage: ./api-walk [TOKEN]
+#   TOKEN : GitHub Personal Access Token (opsional, bisa diisi saat runtime)
+
+set -uo pipefail
 
 API_ROOT="https://api.github.com"
 AUTH_HEADER=""
-TOKEN=""
 
-# Function to fetch API and handle authentication prompt if needed
-fetch_api() {
-  local url=$1
-  local response
-  if [ -n "$AUTH_HEADER" ]; then
-    response=$(curl -s -H "$AUTH_HEADER" "$url")
-  else
-    response=$(curl -s "$url")
-  fi
+# Token dari argumen -> langsung pakai, tidak perlu prompt lagi
+if [[ -n "${1:-}" ]]; then
+  AUTH_HEADER="Authorization: token $1"
+fi
 
-  # Detect if authentication is required or forbidden
-  local msg=$(echo "$response" | jq -r '.message // empty')
-  if [[ "$msg" =~ "Requires authentication" || "$msg" =~ "Bad credentials" || "$msg" =~ "Not Found" || "$msg" =~ "API rate limit exceeded" ]]; then
-    echo "===> Authentication required or invalid token."
-    while true; do
-      read -s -p "Enter your GitHub Personal Access Token: " TOKEN
-      echo
-      AUTH_HEADER="Authorization: token $TOKEN"
-      # Try again with new token
-      response=$(curl -s -H "$AUTH_HEADER" "$url")
-      msg=$(echo "$response" | jq -r '.message // empty')
-      if [[ ! "$msg" =~ "Requires authentication" && ! "$msg" =~ "Bad credentials" && ! "$msg" =~ "API rate limit exceeded" ]]; then
-        break
-      fi
-      echo "Invalid or insufficient token. Please try again."
-    done
-  fi
-  echo "$response"
+# File sementara untuk body curl (dibersihkan saat exit)
+_tmpfile=$(mktemp)
+_http_code=""
+trap 'rm -f "$_tmpfile"' EXIT
+
+# --------------------------------------------------------------------------- #
+# _curl_json <url> [extra curl args...]
+#   Jalankan curl, simpan body ke _tmpfile, set _http_code, kembalikan body.
+# --------------------------------------------------------------------------- #
+_curl_json() {
+  local _url=$1; shift
+  _http_code=$(curl -s -w "%{http_code}" -o "$_tmpfile" "$@" "$_url" 2>/dev/null)
+  cat "$_tmpfile"
 }
 
-# Show and walk API menu
-show_menu() {
+# --------------------------------------------------------------------------- #
+# fetch_api <url>
+#   Fetch URL dengan auth. Prompt token jika 401/403.
+# --------------------------------------------------------------------------- #
+fetch_api() {
   local url=$1
-  local response
-  response=$(fetch_api "$url")
+  local response msg
 
-  # Show all non-URL keys for context
-  echo "$response" | jq -r 'with_entries(select(.value | (type != "string" or (test("^https://") | not))))'
-  echo
-  echo "===> Listing available API endpoints from: $url"
-  echo
+  if [[ -n "$AUTH_HEADER" ]]; then
+    response=$(_curl_json "$url" -H "$AUTH_HEADER")
+  else
+    response=$(_curl_json "$url")
+  fi
 
-  # Find all URL-valued keys
-  mapfile -t keys < <(echo "$response" | jq -r 'to_entries[] | select(.value | type == "string" and test("^https://")) | "\(.key):\(.value)"')
+  msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null)
 
-  if [ ${#keys[@]} -eq 0 ]; then
-    echo "No further navigable URLs found."
-    echo "$response" | jq .
+  # Deteksi kebutuhan auth dari HTTP code atau pesan GitHub
+  if [[ "$_http_code" == "401" || "$_http_code" == "403" || \
+        "$msg" == *"Requires authentication"* || \
+        "$msg" == *"Bad credentials"* || \
+        "$msg" == *"Must authenticate"* ]]; then
+
+    echo "===> Auth diperlukan (HTTP $_http_code: ${msg:-no message})." >&2
+    while true; do
+      local token
+      read -r -s -p "GitHub Personal Access Token: " token </dev/tty
+      echo >&2
+      [[ -z "$token" ]] && { echo "Token tidak boleh kosong." >&2; continue; }
+
+      AUTH_HEADER="Authorization: token $token"
+      response=$(_curl_json "$url" -H "$AUTH_HEADER")
+      msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null)
+
+      if [[ "$_http_code" != "401" && "$_http_code" != "403" && \
+            "$msg" != *"Bad credentials"* && \
+            "$msg" != *"Requires authentication"* ]]; then
+        echo "Token diterima." >&2
+        break
+      fi
+      echo "Token tidak valid (HTTP $_http_code), coba lagi." >&2
+    done
+  fi
+
+  # Rate limit
+  if [[ "$msg" == *"API rate limit exceeded"* ]]; then
+    local reset now wait_sec
+    reset=$(echo "$response" | jq -r '.resources.core.reset // .rate.reset // 0' 2>/dev/null)
+    now=$(date +%s)
+    wait_sec=$(( reset - now ))
+    (( wait_sec < 1 )) && wait_sec=60
+    echo "Rate limit tercapai, tunggu ${wait_sec}s..." >&2
+    sleep "$wait_sec"
+    fetch_api "$url"
     return
   fi
 
-  for i in "${!keys[@]}"; do
-    name=$(echo "${keys[$i]}" | cut -d':' -f1)
-    echo "$((i+1)). $name"
-  done
-
-  echo "0. Exit"
-  while true; do
-    read -p "Choose an endpoint to walk: " choice
-    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 0 && "$choice" -le ${#keys[@]} ]]; then
-      break
-    else
-      echo "Invalid choice. Try again."
-    fi
-  done
-
-  if [[ "$choice" == "0" ]]; then
-    exit 0
-  fi
-
-  index=$((choice-1))
-  selected_url=$(echo "${keys[$index]}" | cut -d':' -f2- | sed 's/^ *//')
-
-  # Prompt for any placeholders like {user}
-  while [[ "$selected_url" =~ \{([a-zA-Z_]+)\} ]]; do
-    var="${BASH_REMATCH[1]}"
-    read -p "Enter value for '$var': " value
-    selected_url="${selected_url//\{$var\}/$value}"
-  done
-
-  show_menu "$selected_url"
+  echo "$response"
 }
 
-# Start the API walker
+# --------------------------------------------------------------------------- #
+# show_fields <json>
+#   Tampilkan semua field scalar (bukan URL, bukan object/array).
+#   Dua select() terpisah — tidak gabung dengan "and" agar tidak error di jq
+#   ketika value bukan string.
+# --------------------------------------------------------------------------- #
+show_fields() {
+  echo "$1" | jq -r '
+    if type == "array" then
+      "[ Array: \(length) item(s) ]"
+    elif type == "object" then
+      to_entries[]
+      | select(.value | type | . != "object" and . != "array")
+      | select(.value | type == "string" | not or
+               (type == "string" and (test("^https://") | not)))
+      | "\(.key): \(.value)"
+    else "Response: \(.)" end
+  ' 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------- #
+# collect_url_keys <json>
+#   Cetak key<TAB>url untuk semua value yang berupa URL, satu per baris.
+#   Dua select() terpisah untuk keamanan tipe.
+# --------------------------------------------------------------------------- #
+collect_url_keys() {
+  echo "$1" | jq -r '
+    ( if type == "array" then .[0] // {} else . end )
+    | if type == "object" then
+        to_entries[]
+        | select(.value | type == "string")
+        | select(.value | test("^https://"))
+        | "\(.key)\t\(.value)"
+      else empty end
+  ' 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------- #
+# show_menu <start_url>
+# --------------------------------------------------------------------------- #
+show_menu() {
+  local url="$1"
+  local -a history=()
+
+  while true; do
+    printf '\n===> Fetching: %s\n' "$url" >&2
+
+    local response
+    response=$(fetch_api "$url")
+
+    # Field scalar
+    echo "--- Fields ---" >&2
+    show_fields "$response" >&2
+    echo >&2
+
+    # Kumpulkan URL keys
+    local -a keys=()
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] && keys+=("$entry")
+    done < <(collect_url_keys "$response")
+
+    if (( ${#keys[@]} == 0 )); then
+      echo "(Tidak ada URL yang bisa dinavigasi di endpoint ini.)" >&2
+      echo "--- Full response ---" >&2
+      echo "$response" | jq . 2>/dev/null >&2 || echo "$response" >&2
+    fi
+
+    # Menu
+    echo "===> Endpoint yang tersedia:" >&2
+    for i in "${!keys[@]}"; do
+      printf "  %2d. %s\n" "$((i+1))" "$(printf '%s' "${keys[$i]}" | cut -f1)" >&2
+    done
+    (( ${#history[@]} > 0 )) && echo "   b. Kembali" >&2
+    echo "   0. Keluar" >&2
+
+    local choice
+    while true; do
+      read -r -p "Pilihan: " choice </dev/tty
+      choice="${choice// /}"
+
+      if [[ "$choice" == "0" ]]; then
+        echo "Keluar." >&2; exit 0
+
+      elif [[ "$choice" == "b" || "$choice" == "B" ]]; then
+        if (( ${#history[@]} > 0 )); then
+          url="${history[-1]}"
+          unset 'history[-1]'
+          break
+        else
+          echo "Sudah di root." >&2
+        fi
+
+      elif [[ "$choice" =~ ^[0-9]+$ ]] && \
+           (( choice >= 1 && choice <= ${#keys[@]} )); then
+
+        local selected_url
+        selected_url=$(printf '%s' "${keys[$((choice-1))]}" | cut -f2)
+
+        # Expand URI template satu per satu: {var}, {/var}, {+var}
+        # Skip {&var,...} karena itu query opsional
+        local regex='\{([/?+]?)([a-zA-Z_][a-zA-Z_0-9]*)\}'
+        while [[ "$selected_url" =~ $regex ]]; do
+          local prefix="${BASH_REMATCH[1]}"
+          local var="${BASH_REMATCH[2]}"
+          local full="${BASH_REMATCH[0]}"
+          local val
+          read -r -p "Nilai untuk '${full}': " val </dev/tty
+          if [[ "$prefix" == "/" ]]; then
+            selected_url="${selected_url//$full//$val}"
+          else
+            selected_url="${selected_url//$full/$val}"
+          fi
+        done
+
+        # Hapus sisa template opsional {&page,...}
+        selected_url=$(echo "$selected_url" | sed 's/{[^}]*}//g')
+
+        history+=("$url")
+        url="$selected_url"
+        break
+
+      else
+        echo "Pilihan tidak valid, coba lagi." >&2
+      fi
+    done
+  done
+}
+
 show_menu "$API_ROOT"

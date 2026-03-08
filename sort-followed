@@ -1,4 +1,8 @@
 #!/bin/bash
+# sort-followed: Sort a list of followed users by their follower count (ascending).
+# Usage: ./sort-followed GITHUB_TOKEN [--file FOLLOWED_FILE]
+
+set -uo pipefail
 
 if (( $# < 1 )); then
   echo "Usage: $(basename "$0") GITHUB_TOKEN [--file FOLLOWED_FILE]"
@@ -9,54 +13,67 @@ GITHUB_TOKEN=$1
 shift
 
 FOLLOWED_FILE="followed_users.txt"
-
 while (( $# )); do
   case "$1" in
-    --file)
-      shift
-      FOLLOWED_FILE="$1"
-      shift
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
+    --file) shift ; FOLLOWED_FILE="$1" ; shift ;;
+    *)      echo "Unknown option: $1" >&2 ; exit 1 ;;
   esac
 done
 
 if [[ ! -f "$FOLLOWED_FILE" ]]; then
-  echo "File $FOLLOWED_FILE not found."
+  echo "File '$FOLLOWED_FILE' not found." >&2
   exit 1
 fi
 
-TMP_SORT=$(mktemp)
-user_count=$(grep -cve '^\s*$' "$FOLLOWED_FILE")
+BASE_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+API="https://api.github.com"
+
+# Count non-blank lines
+user_count=$(grep -cve '^\s*$' "$FOLLOWED_FILE" || true)
+if (( user_count == 0 )); then
+  echo "File is empty – nothing to sort."
+  exit 0
+fi
+
+TMP_DATA=$(mktemp)   # "followers<TAB>username" lines for sort
 done_count=0
 
+# --------------------------------------------------------------------------- #
+# progress_bar <current> <total>
+#   Writes to stderr so it does NOT contaminate any stdout pipeline.
+# --------------------------------------------------------------------------- #
 progress_bar() {
-  local progress=$1
-  local total=$2
-  local width=40
+  local progress=$1 total=$2 width=40
   local percent=$(( 100 * progress / total ))
   local filled=$(( width * progress / total ))
   local empty=$(( width - filled ))
-  printf "\r["
-  for ((i=0; i<filled; i++)); do printf "#"; done
-  for ((i=0; i<empty; i++)); do printf " "; done
-  printf "] %3d%% (%d/%d)" "$percent" "$progress" "$total"
+  printf "\r[" >&2
+  for (( i=0; i<filled; i++ )); do printf "#" >&2; done
+  for (( i=0; i<empty;  i++ )); do printf " " >&2; done
+  printf "] %3d%% (%d/%d)  " "$percent" "$progress" "$total" >&2
 }
 
-while read -r user; do
+echo "Fetching follower counts for $user_count users…" >&2
+
+while IFS= read -r user; do
   [[ -z "$user" ]] && continue
-  ((done_count++))
+  (( ++done_count ))                           # pre-increment → always ≥ 1 (safe with set -e)
   progress_bar "$done_count" "$user_count"
-  printf "  |  %s" "$user"
-  followers=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/users/$user" | jq -r '.followers // 0')
-  echo -e "$followers\t$user"
-done < "$FOLLOWED_FILE" | sort -n > "$TMP_SORT"
+  printf "%-30s" "$user" >&2                   # show current username on stderr
 
-cut -f2 "$TMP_SORT" > "$FOLLOWED_FILE"
-rm "$TMP_SORT"
+  followers=$(curl -sf \
+    -H "$BASE_HEADER" \
+    "$API/users/$user" 2>/dev/null \
+    | jq -r '.followers // 0')
 
-progress_bar "$user_count" "$user_count"
-printf "\nSelesai! File %s sudah diurutkan dari followers terkecil ke terbesar.\n" "$FOLLOWED_FILE"
+  # Write sort key to temp file (number<TAB>username)
+  printf "%d\t%s\n" "${followers:-0}" "$user" >> "$TMP_DATA"
+done < "$FOLLOWED_FILE"
+
+printf "\n" >&2
+
+# Sort numerically by follower count, extract just the usernames
+sort -n "$TMP_DATA" | cut -f2 > "$FOLLOWED_FILE"
+rm -f "$TMP_DATA"
+
+echo "Done! '$FOLLOWED_FILE' is now sorted from fewest to most followers." >&2

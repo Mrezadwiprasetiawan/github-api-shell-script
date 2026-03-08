@@ -1,7 +1,11 @@
 #!/bin/bash
+# follow-most-user: Follow users sorted by follower count, skipping already-followed ones.
+# Usage: ./follow-most-user GITHUB_TOKEN [--reset] [--file FILE] [--min-followers N] [--max-followers N]
+
+set -uo pipefail
 
 if (( $# < 1 )); then
-  echo "Usage: $(basename "$0") GITHUB_TOKEN [--reset] [--file FILE_NAME] [--min-followers N] [--max-followers N]"
+  echo "Usage: $(basename "$0") GITHUB_TOKEN [--reset] [--file FILE] [--min-followers N] [--max-followers N]"
   exit 1
 fi
 
@@ -11,130 +15,143 @@ shift
 RESET=0
 FOLLOWED_FILE="followed_users.txt"
 MIN_FOLLOWERS=1000
-MAX_FOLLOWERS=
+MAX_FOLLOWERS=""
 PER_PAGE=100
 
-# Parse options
 while (( $# )); do
   case "$1" in
-    --reset)
-      RESET=1
-      shift
-      ;;
-    --file)
-      shift
-      FOLLOWED_FILE="$1"
-      shift
-      ;;
-    --min-followers)
-      shift
-      MIN_FOLLOWERS="$1"
-      shift
-      ;;
-    --max-followers)
-      shift
-      MAX_FOLLOWERS="$1"
-      shift
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
+    --reset)         RESET=1 ; shift ;;
+    --file)          shift ; FOLLOWED_FILE="$1" ; shift ;;
+    --min-followers) shift ; MIN_FOLLOWERS="$1" ; shift ;;
+    --max-followers) shift ; MAX_FOLLOWERS="$1" ; shift ;;
+    *) echo "Unknown option: $1" >&2 ; exit 1 ;;
   esac
 done
 
-if (( RESET )); then
-  rm -f "$FOLLOWED_FILE"
-fi
+(( RESET )) && rm -f "$FOLLOWED_FILE"
 touch "$FOLLOWED_FILE"
 
-# Load followed users into an associative array for fast lookup
 declare -A followed
-while read -r user; do
+while IFS= read -r user; do
   [[ -n "$user" ]] && followed["$user"]=1
 done < "$FOLLOWED_FILE"
 
-tput civis
-trap 'tput cnorm; exit' INT TERM EXIT
+BASE_HEADER="Authorization: Bearer $GITHUB_TOKEN"
+API="https://api.github.com"
 
+tput civis 2>/dev/null || true
+trap 'tput cnorm 2>/dev/null || true' INT TERM EXIT
+
+# --------------------------------------------------------------------------- #
+# wait_for_rate_limit_reset <bucket>
+#   bucket: "core" | "search"
+# --------------------------------------------------------------------------- #
 wait_for_rate_limit_reset() {
-  echo -e "\nRate limit exceeded; waiting for reset…"
-  while :; do
-    rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-    rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
-    rst=$(echo "$rl" | jq -r '.resources.core.reset // 0')
-    (( rem > 0 )) && break
+  local bucket="${1:-core}"
+  echo -e "\nRate limit exceeded (${bucket}); waiting for reset…"
+  while true; do
+    local rl rem rst now
+    rl=$(curl -sf -H "$BASE_HEADER" "$API/rate_limit" 2>/dev/null) || rl="{}"
+    rem=$(echo "$rl" | jq -r ".resources.${bucket}.remaining // 0")
+    rst=$(echo "$rl" | jq -r ".resources.${bucket}.reset // 0")
+    (( rem > 0 )) && return
     now=$(date +%s)
-    sleep $(( rst > now ? rst - now : 1 ))
+    local wait_sec=$(( rst - now ))
+    (( wait_sec < 1 )) && wait_sec=5
+    sleep "$wait_sec"
   done
 }
 
-get_top_users() {
-  local page=$1
-  local q="followers:>=$MIN_FOLLOWERS"
-  if [[ -n "$MAX_FOLLOWERS" ]]; then
-    q="followers:$MIN_FOLLOWERS..$MAX_FOLLOWERS"
-  fi
-  curl -s -H "Authorization: token $GITHUB_TOKEN" \
-    "https://api.github.com/search/users?q=$q&sort=followers&order=desc&per_page=$PER_PAGE&page=$page"
+# --------------------------------------------------------------------------- #
+# check_rate_limit <bucket> <min_remaining>
+# --------------------------------------------------------------------------- #
+check_rate_limit() {
+  local bucket="${1:-core}" min_rem="${2:-2}"
+  local rl rem
+  rl=$(curl -sf -H "$BASE_HEADER" "$API/rate_limit" 2>/dev/null) || return
+  rem=$(echo "$rl" | jq -r ".resources.${bucket}.remaining // 0")
+  (( rem <= min_rem )) && wait_for_rate_limit_reset "$bucket"
 }
 
 count=0
 page=1
+# GitHub Search API caps at 1 000 results (10 pages × 100)
+MAX_SEARCH_PAGES=10
 
-while :; do
-  # Rate limit check before batch
-  rl=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/rate_limit)
-  rem=$(echo "$rl" | jq -r '.resources.core.remaining // 0')
-  (( rem <= 1 )) && wait_for_rate_limit_reset
+while (( page <= MAX_SEARCH_PAGES )); do
+  check_rate_limit "search" 2
 
-  users_json=$(get_top_users $page)
-  user_logins=$(echo "$users_json" | jq -r '.items[]?.login')
-  [[ -z "$user_logins" ]] && break
+  # Build follower-range query
+  local_q="followers:>=${MIN_FOLLOWERS}"
+  if [[ -n "$MAX_FOLLOWERS" ]]; then
+    local_q="followers:${MIN_FOLLOWERS}..${MAX_FOLLOWERS}"
+  fi
 
-  for u in $user_logins; do
-    printf "\r%-60s" "$u: checking…"
-    # Skip if already followed in our set
+  users_json=$(curl -sf -H "$BASE_HEADER" \
+    "$API/search/users?q=${local_q}&sort=followers&order=desc&per_page=$PER_PAGE&page=$page" \
+    2>/dev/null) || users_json="{}"
+
+  # Search API rate limit errors surface in .message
+  local_msg=$(echo "$users_json" | jq -r '.message // empty' 2>/dev/null)
+  if [[ "$local_msg" == *"rate limit"* || "$local_msg" == *"abuse"* ]]; then
+    wait_for_rate_limit_reset "search"
+    continue
+  fi
+
+  mapfile -t user_logins < <(echo "$users_json" | jq -r '.items[]?.login' 2>/dev/null)
+  (( ${#user_logins[@]} == 0 )) && break
+
+  for u in "${user_logins[@]}"; do
+    printf "\r%-70s" "$u: checking…"
+
+    # Skip already-followed users (no API call needed)
     if [[ ${followed["$u"]+_} ]]; then
+      printf "\r%-70s\n" "$u: already followed – skip"
       continue
     fi
 
-    # Get follower count for this user (optional: verify again)
-    followers=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-      "https://api.github.com/users/$u" | jq .followers)
-    if (( followers < MIN_FOLLOWERS )); then
-      continue
-    fi
-    if [[ -n "$MAX_FOLLOWERS" && $followers -gt $MAX_FOLLOWERS ]]; then
-      continue
+    # The search query already filters by follower count, but re-check MIN/MAX
+    # using the user detail only when MAX_FOLLOWERS is set (can't express range precisely)
+    if [[ -n "$MAX_FOLLOWERS" ]]; then
+      check_rate_limit "core" 2
+      user_info=$(curl -sf -H "$BASE_HEADER" "$API/users/$u" 2>/dev/null) || user_info="{}"
+      local_followers=$(echo "$user_info" | jq -r '.followers // 0')
+      if (( local_followers < MIN_FOLLOWERS || local_followers > MAX_FOLLOWERS )); then
+        continue
+      fi
     fi
 
-    # Try to follow (idempotent)
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-      -H "Authorization: token $GITHUB_TOKEN" \
-      https://api.github.com/user/following/"$u")
+    check_rate_limit "core" 2
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -X PUT \
+      -H "$BASE_HEADER" \
+      -H "Content-Length: 0" \
+      "$API/user/following/$u")
 
     if (( code == 204 )); then
       echo "$u" >> "$FOLLOWED_FILE"
       followed["$u"]=1
-      (( count++ ))
-      printf "\r%-60s\n" "$u: followed ($followers followers)"
+      (( count++ )) || true
+      printf "\r%-70s\n" "$u: followed"
     elif (( code == 403 )); then
-      wait_for_rate_limit_reset
-      code2=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-        -H "Authorization: token $GITHUB_TOKEN" \
-        https://api.github.com/user/following/"$u")
+      wait_for_rate_limit_reset "core"
+      # Retry once after reset
+      code2=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT \
+        -H "$BASE_HEADER" \
+        -H "Content-Length: 0" \
+        "$API/user/following/$u")
       if (( code2 == 204 )); then
         echo "$u" >> "$FOLLOWED_FILE"
         followed["$u"]=1
-        (( count++ ))
+        (( count++ )) || true
+        printf "\r%-70s\n" "$u: followed (after retry)"
       fi
     fi
   done
 
-  # Next page
-  ((page++))
+  (( page++ ))
 done
 
-tput cnorm
-echo -e "\nDone. Total followed: $count"
+tput cnorm 2>/dev/null || true
+echo -e "\nDone. Total newly followed: $count"
